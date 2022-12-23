@@ -234,7 +234,10 @@ class Task(object):
   def run(self):
     begin = time.time()
     with open(self.log_file, 'w') as log:
-      task = subprocess.Popen(self.test_command, stdout=log, stderr=log)
+      if MAX_GPU_INDEX is not None:
+        # Set CUDA_VISIBLE_DEVICES to the GPU index for this task.
+        env = next(JOB_ENV_IT)
+      task = subprocess.Popen(self.test_command, stdout=log, stderr=log, env=env)
       try:
         self.exit_code = sigint_handler.wait(task)
       except sigint_handler.ProcessWasInterrupted:
@@ -626,6 +629,7 @@ def find_tests(binaries, additional_args, options, times):
     command += ['--gtest_color=' + options.gtest_color]
 
     test_group = ''
+    gtest_filter = []
     for line in test_list:
       if not line.strip():
         continue
@@ -646,18 +650,21 @@ def find_tests(binaries, additional_args, options, times):
       if '.PRE_' in test_name:
         continue
 
-      last_execution_time = times.get_test_time(test_binary, test_name)
-      if options.failed and last_execution_time is not None:
-        continue
-
-      test_command = command + ['--gtest_filter=' + test_name]
       if (test_count - options.shard_index) % options.shard_count == 0:
-        for execution_number in range(options.repeat):
-          tasks.append(
-              Task(test_binary, test_name, test_command, execution_number + 1,
-                   last_execution_time, options.output_dir))
+          gtest_filter += [test_name]
 
-      test_count += 1
+    last_execution_time = times.get_test_time(test_binary, "")
+    if options.failed and last_execution_time is not None:
+      continue
+
+    if gtest_filter:
+      for execution_number in range(options.repeat):
+        test_command = command + ['--gtest_filter=' + ":".join(gtest_filter)]
+        tasks.append(
+            Task(test_binary, test_binary, test_command, execution_number + 1,
+                  last_execution_time, options.output_dir))
+
+    test_count += 1
 
   # Sort the tasks to run the slowest tests first, so that faster ones can be
   # finished in parallel.
@@ -797,8 +804,29 @@ def default_options_parser():
                     default=False,
                     help='Do not run tests from the same test '
                     'case in parallel.')
+  parser.add_option('--max_gpu_index', type='int', default=None,
+                    help='Maximum index of GPU to use.')
+
   return parser
 
+
+MAX_GPU_INDEX: "None | int" = None
+_temp_dirs: "list[tempfile.TemporaryDirectory]" = []
+
+def _job_env():
+  global MAX_GPU_INDEX
+  count = 0
+  while True:
+    env = os.environ.copy()
+    d = tempfile.TemporaryDirectory()
+    _temp_dirs.append(d)
+    env['TMPDIR'] = d.name
+    if MAX_GPU_INDEX is not None:
+        env['CUDA_VISIBLE_DEVICES'] = str(count % (MAX_GPU_INDEX + 1))
+    count += 1
+    yield env
+
+JOB_ENV_IT = _job_env() 
 
 def main():
   # Remove additional arguments (anything after --).
@@ -823,6 +851,9 @@ def main():
   # and clean that directory out on startup, instead of nuking Docs/.
   if options.output_dir:
     options.output_dir = os.path.join(options.output_dir, 'gtest-parallel-logs')
+
+  global MAX_GPU_INDEX
+  MAX_GPU_INDEX = options.max_gpu_index
 
   if binaries == []:
     parser.print_usage()
